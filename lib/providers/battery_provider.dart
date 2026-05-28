@@ -14,13 +14,10 @@ class BatteryProvider extends ChangeNotifier {
   BatteryStatistics _statistics = BatteryStatistics();
 
   // 前台计时相关
-  Timer? _foregroundTimer;
   bool _isAppInForeground = false;
-  DateTime? _foregroundStartTime;
 
-  // 充电断开计时相关
-  Timer? _fullChargeTimer;
-  bool _hasTriggeredFullChargeTimer = false;
+  // 前台亮屏计时（断开充电后）
+  Timer? _screenOnTimer;
 
   // 电池状态监听
   StreamSubscription? _batteryStateSubscription;
@@ -35,83 +32,79 @@ class BatteryProvider extends ChangeNotifier {
     await _storage.init();
     _statistics = _storage.loadStatistics();
 
-    // 获取当前电池状态
-    _batteryLevel = await _battery.batteryLevel;
-    _batteryStateSubscription = _battery.onBatteryStateChanged.listen(
-      _onBatteryStateChanged,
-    );
+    try {
+      _batteryLevel = await _battery.batteryLevel;
+      _batteryStateSubscription = _battery.onBatteryStateChanged.listen(
+        _onBatteryStateChanged,
+      );
+    } catch (_) {}
 
-    // 恢复充电断开计时状态
-    _restoreFullChargeTimer();
+    // 如果已断开充电且在前台，恢复亮屏计时
+    if (!_isCharging &&
+        _statistics.chargeEndTime != null &&
+        _isAppInForeground) {
+      _startScreenOnTimer();
+    }
 
     notifyListeners();
   }
 
-  /// 恢复充满电断开后的计时
-  void _restoreFullChargeTimer() {
-    if (_statistics.lastFullChargeDisconnectTime != null) {
-      _hasTriggeredFullChargeTimer = true;
-      _startFullChargeTimer();
-    }
-  }
-
   /// 处理电池状态变化
   void _onBatteryStateChanged(BatteryState state) {
-    final newCharging = state == BatteryState.charging ||
-        state == BatteryState.full;
+    final newCharging =
+        state == BatteryState.charging || state == BatteryState.full;
 
-    // 如果充电状态发生了变化
-    if (newCharging != _isCharging) {
-      _isCharging = newCharging;
+    if (newCharging == _isCharging) return;
+    _isCharging = newCharging;
 
-      // 充满电后断开充电 -> 开始计时
-      if (!_isCharging &&
-          _batteryLevel >= 100 &&
-          !_hasTriggeredFullChargeTimer) {
-        _statistics = BatteryStatistics(
-          lastFullChargeDisconnectTime: DateTime.now(),
-          totalForegroundSeconds: _statistics.totalForegroundSeconds,
-        );
-        _hasTriggeredFullChargeTimer = true;
-        _startFullChargeTimer();
-        _saveData();
-      }
+    if (_isCharging) {
+      // ======== 开始充电 ========
+      _statistics = BatteryStatistics(
+        lastFullChargeDisconnectTime:
+            _statistics.lastFullChargeDisconnectTime,
+        totalForegroundSeconds: _statistics.totalForegroundSeconds,
+        lastChargeStartLevel: _batteryLevel,
+        chargeEndTime: _statistics.chargeEndTime,
+        screenOnSecondsAfterCharge: _statistics.screenOnSecondsAfterCharge,
+        chargeStartTime: DateTime.now(),
+        chargeEndLevel: _statistics.chargeEndLevel,
+      );
+      _stopScreenOnTimer();
+    } else {
+      // ======== 结束充电 ========
+      _statistics = BatteryStatistics(
+        lastFullChargeDisconnectTime:
+            _statistics.lastFullChargeDisconnectTime,
+        totalForegroundSeconds: _statistics.totalForegroundSeconds,
+        lastChargeStartLevel: _statistics.lastChargeStartLevel,
+        chargeEndTime: DateTime.now(),
+        screenOnSecondsAfterCharge: 0,
+        chargeStartTime: _statistics.chargeStartTime,
+        chargeEndLevel: _batteryLevel,
+      );
 
-      // 开始充电 -> 重置计时状态
-      if (_isCharging) {
-        _hasTriggeredFullChargeTimer = false;
-        _statistics = BatteryStatistics(
-          lastFullChargeDisconnectTime: null,
-          totalForegroundSeconds: _statistics.totalForegroundSeconds,
-        );
-        _stopFullChargeTimer();
-        _saveData();
+      if (_isAppInForeground) {
+        _startScreenOnTimer();
       }
     }
 
+    _saveData();
     notifyListeners();
   }
 
   /// 更新电量（由定时器周期性调用）
   Future<void> updateBatteryLevel() async {
-    final level = await _battery.batteryLevel;
-
-    if (level != _batteryLevel) {
-      _batteryLevel = level;
-
-      // 保存历史记录
-      await _storage.saveBatteryRecord(
-        level: _batteryLevel,
-        isCharging: _isCharging,
-      );
-
-      // 达到100%并且正在充电
-      if (_batteryLevel >= 100 && _isCharging) {
-        _hasTriggeredFullChargeTimer = false; // 重置，等待断开时触发
+    try {
+      final level = await _battery.batteryLevel;
+      if (level != _batteryLevel) {
+        _batteryLevel = level;
+        await _storage.saveBatteryRecord(
+          level: _batteryLevel,
+          isCharging: _isCharging,
+        );
+        notifyListeners();
       }
-
-      notifyListeners();
-    }
+    } catch (_) {}
   }
 
   // ---- 前台运行时长相关 ----
@@ -120,56 +113,43 @@ class BatteryProvider extends ChangeNotifier {
   void onAppForeground() {
     if (_isAppInForeground) return;
     _isAppInForeground = true;
-    _foregroundStartTime = DateTime.now();
 
-    // 启动前台计时器
-    _foregroundTimer?.cancel();
-    _foregroundTimer = Timer.periodic(const Duration(seconds: 1), (_) {
-      _updateForegroundTime();
-    });
+    if (!_isCharging && _statistics.chargeEndTime != null) {
+      _startScreenOnTimer();
+    }
   }
 
   /// 应用进入后台
   void onAppBackground() {
     if (!_isAppInForeground) return;
     _isAppInForeground = false;
-
-    // 立即更新一次前台时间
-    _updateForegroundTime();
-    _foregroundTimer?.cancel();
-    _foregroundTimer = null;
-    _foregroundStartTime = null;
+    _stopScreenOnTimer();
   }
 
-  /// 更新前台累计运行时间
-  void _updateForegroundTime() {
-    if (_foregroundStartTime == null) return;
-    final elapsed =
-        DateTime.now().difference(_foregroundStartTime!).inSeconds;
-    if (elapsed > 0) {
+  /// 启动亮屏计时器（每秒 +1）
+  void _startScreenOnTimer() {
+    _screenOnTimer?.cancel();
+    _screenOnTimer = Timer.periodic(const Duration(seconds: 1), (_) {
       _statistics = BatteryStatistics(
         lastFullChargeDisconnectTime:
             _statistics.lastFullChargeDisconnectTime,
-        totalForegroundSeconds: _statistics.totalForegroundSeconds + elapsed,
+        totalForegroundSeconds: _statistics.totalForegroundSeconds,
+        lastChargeStartLevel: _statistics.lastChargeStartLevel,
+        chargeEndTime: _statistics.chargeEndTime,
+        screenOnSecondsAfterCharge:
+            _statistics.screenOnSecondsAfterCharge + 1,
+        chargeStartTime: _statistics.chargeStartTime,
+        chargeEndLevel: _statistics.chargeEndLevel,
       );
-      _foregroundStartTime = DateTime.now();
       _saveData();
-      notifyListeners();
-    }
-  }
-
-  // ---- 充满电断开计时器 ----
-
-  void _startFullChargeTimer() {
-    _fullChargeTimer?.cancel();
-    _fullChargeTimer = Timer.periodic(const Duration(seconds: 1), (_) {
       notifyListeners();
     });
   }
 
-  void _stopFullChargeTimer() {
-    _fullChargeTimer?.cancel();
-    _fullChargeTimer = null;
+  /// 停止亮屏计时器
+  void _stopScreenOnTimer() {
+    _screenOnTimer?.cancel();
+    _screenOnTimer = null;
   }
 
   // ---- 工具方法 ----
@@ -181,8 +161,7 @@ class BatteryProvider extends ChangeNotifier {
   /// 重置所有统计数据
   Future<void> resetStatistics() async {
     _statistics = BatteryStatistics();
-    _hasTriggeredFullChargeTimer = false;
-    _stopFullChargeTimer();
+    _stopScreenOnTimer();
     await _storage.clearAll();
     notifyListeners();
   }
@@ -190,8 +169,7 @@ class BatteryProvider extends ChangeNotifier {
   @override
   void dispose() {
     _batteryStateSubscription?.cancel();
-    _foregroundTimer?.cancel();
-    _fullChargeTimer?.cancel();
+    _stopScreenOnTimer();
     super.dispose();
   }
 }
