@@ -34,6 +34,9 @@ class BatteryProvider extends ChangeNotifier {
 
     try {
       _batteryLevel = await _battery.batteryLevel;
+      final state = await _battery.batteryState;
+      _isCharging =
+          state == BatteryState.charging || state == BatteryState.full;
       _batteryStateSubscription = _battery.onBatteryStateChanged.listen(
         _onBatteryStateChanged,
       );
@@ -49,11 +52,8 @@ class BatteryProvider extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// 处理电池状态变化
-  void _onBatteryStateChanged(BatteryState state) {
-    final newCharging =
-        state == BatteryState.charging || state == BatteryState.full;
-
+  /// 处理充电状态变化（统一入口）
+  void _handleChargingChanged(bool newCharging) {
     if (newCharging == _isCharging) return;
     _isCharging = newCharging;
 
@@ -92,10 +92,25 @@ class BatteryProvider extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// 更新电量（由定时器周期性调用）
+  /// 处理电池状态变化（来自 Stream 监听）
+  void _onBatteryStateChanged(BatteryState state) {
+    final newCharging =
+        state == BatteryState.charging || state == BatteryState.full;
+    _handleChargingChanged(newCharging);
+  }
+
+  /// 更新电量（每 5 秒调用），同时检查充电状态变化
   Future<void> updateBatteryLevel() async {
     try {
       final level = await _battery.batteryLevel;
+      final state = await _battery.batteryState;
+      final newCharging =
+          state == BatteryState.charging || state == BatteryState.full;
+
+      // 先处理充电状态变化（确保及时响应插拔）
+      _handleChargingChanged(newCharging);
+
+      // 再更新电量
       if (level != _batteryLevel) {
         _batteryLevel = level;
         await _storage.saveBatteryRecord(
